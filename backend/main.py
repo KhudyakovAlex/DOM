@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import text
@@ -39,6 +39,10 @@ def health_check():
 
 # --- Tiles (PMTiles) ---
 TILES_DIR = Path(__file__).resolve().parent / "app" / "static" / "pmtiles"
+
+# --- Models (GLB) ---
+MODELS_DIR = Path(__file__).resolve().parent / "app" / "static" / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/api/tiles/{filename}", tags=["tiles"])
@@ -107,5 +111,61 @@ async def get_pmtiles(filename: str, request: Request):
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Expose-Headers": "Content-Length, Content-Range",
             "Cache-Control": "public, max-age=86400",
+        },
+    )
+
+
+@app.get("/api/models", tags=["models"])
+async def list_models():
+    items = []
+    for p in sorted(MODELS_DIR.glob("*.glb")):
+        stat = p.stat()
+        items.append(
+            {
+                "name": p.name,
+                "size_bytes": stat.st_size,
+                "modified_epoch": int(stat.st_mtime),
+                "url": f"/models/{p.name}",
+            }
+        )
+    return {"items": items}
+
+
+@app.post("/api/models/upload", tags=["models"])
+async def upload_model(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".glb"):
+        raise HTTPException(status_code=400, detail="Only .glb files are supported")
+
+    safe_name = Path(file.filename).name
+    dest = MODELS_DIR / safe_name
+
+    # Пишем на диск
+    with dest.open("wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    return {"name": safe_name, "url": f"/models/{safe_name}"}
+
+
+@app.get("/models/{filename}", tags=["models"])
+async def get_model(filename: str):
+    if not filename.lower().endswith(".glb"):
+        raise HTTPException(status_code=400, detail="Only .glb files are supported")
+
+    safe_name = Path(filename).name
+    file_path = MODELS_DIR / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    return FileResponse(
+        path=file_path,
+        media_type="model/gltf-binary",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            # чтобы обновления .glb подхватывались сразу
+            "Cache-Control": "no-store",
         },
     )

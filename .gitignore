@@ -50,6 +50,9 @@ MAP/
 # Large binary map tiles
 *.pmtiles
 
+# Large 3D models
+*.glb
+
 # OS
 .DS_Store
 Thumbs.db
