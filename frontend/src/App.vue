@@ -133,6 +133,8 @@ const tankInstances = []
 const tankVersion = ref(Date.now())
 
 const TANK_SAND_COLOR = new THREE.Color('#d2b48c') // песочный
+const TANK_OUTLINE_COLOR = 0x00bfff // голубой силуэт при наведении
+const TANK_OUTLINE_SCALE = 1.04 // толщина обводки (2–4% больше модели)
 // Настройка ориентации танка на карте
 const TANK_ROT_X = Math.PI / 2 // чтобы модель "стояла" на земле
 const TANK_ROT_Y = 0
@@ -143,6 +145,11 @@ const TANK_TURN_RATE_RAD_S = (Math.PI / 2) / 5 // 90° за 5 сек
 // Подстройка "куда смотрит" модель (если поедет задом — поставим Math.PI)
 const TANK_MODEL_YAW_FIX_RAD = Math.PI
 let lastAnimTimeMs = 0
+
+const mouseState = { x: 0, y: 0 }
+let hoveredTankAnchor = null
+let raycaster = null
+const mouseNDC = new THREE.Vector2()
 
 function toMercator(lngLat) {
   const c = maplibregl.MercatorCoordinate.fromLngLat([lngLat.lng, lngLat.lat], 0)
@@ -523,6 +530,7 @@ function clearLines() {
 function clearPlacedModels() {
   placedModels.value = []
   tankInstances.length = 0
+  hoveredTankAnchor = null
   if (threeScene) {
     // оставим только свет (первые 2 объекта)
     while (threeScene.children.length > 2) {
@@ -530,6 +538,28 @@ function clearPlacedModels() {
     }
   }
   if (map) map.triggerRepaint()
+}
+
+function addOutlineToTank(anchor) {
+  anchor.traverse((child) => {
+    if (!child.isMesh || !child.geometry || child.userData.__isOutline) return
+    const outline = new THREE.Mesh(
+      child.geometry,
+      new THREE.MeshBasicMaterial({
+        color: TANK_OUTLINE_COLOR,
+        side: THREE.BackSide,
+        depthWrite: false
+      })
+    )
+    outline.scale.setScalar(TANK_OUTLINE_SCALE)
+    outline.visible = false
+    outline.renderOrder = -1
+    outline.userData.__isOutline = true
+    outline.userData.__tankAnchor = anchor
+    child.add(outline)
+    child.userData.__outlineMesh = outline
+    child.userData.__tankAnchor = anchor
+  })
 }
 
 function addTankAt(lngLat) {
@@ -564,6 +594,7 @@ function addTankAt(lngLat) {
   anchor.userData.__placedId = id
   anchor.userData.__yaw = yaw
 
+  addOutlineToTank(anchor)
   threeScene.add(anchor)
   tankInstances.push(anchor)
   map.triggerRepaint()
@@ -650,8 +681,14 @@ function ensureThreeLayer() {
     type: 'custom',
     renderingMode: '3d',
     onAdd: function (m, gl) {
+      raycaster = new THREE.Raycaster()
       threeCamera = new THREE.Camera()
       threeScene = new THREE.Scene()
+
+      m.on('mousemove', (e) => {
+        mouseState.x = e.point.x
+        mouseState.y = e.point.y
+      })
 
       const ambient = new THREE.AmbientLight(0xffffff, 0.9)
       const dir = new THREE.DirectionalLight(0xffffff, 0.6)
@@ -781,6 +818,43 @@ function ensureThreeLayer() {
           (obj.userData.__z - center.z)
         )
         obj.scale.set(scale, scale, scale)
+      }
+
+      // Raycasting: наведение на танк → обводка
+      if (raycaster && tankInstances.length > 0) {
+        const canvas = map.getCanvas()
+        const t = map.transform
+        const w = (t?.width ?? canvas.getBoundingClientRect().width) || 1
+        const h = (t?.height ?? canvas.getBoundingClientRect().height) || 1
+        mouseNDC.x = (mouseState.x / w) * 2 - 1
+        mouseNDC.y = 1 - (mouseState.y / h) * 2
+
+        // Луч через unproject near/far (THREE.Camera без position)
+        const invProj = new THREE.Matrix4().copy(threeCamera.projectionMatrix).invert()
+        const nearPt = new THREE.Vector3(mouseNDC.x, mouseNDC.y, -1).applyMatrix4(invProj)
+        const farPt = new THREE.Vector3(mouseNDC.x, mouseNDC.y, 1).applyMatrix4(invProj)
+        const dir = farPt.clone().sub(nearPt).normalize()
+        raycaster.ray.set(nearPt, dir)
+
+        const meshes = []
+        tankInstances.forEach((a) => a.traverse((c) => { if (c.isMesh && !c.userData.__isOutline) meshes.push(c) }))
+        const hits = raycaster.intersectObjects(meshes, false)
+
+        let nextHovered = null
+        if (hits.length > 0) {
+          const hit = hits[0]
+          nextHovered = hit.object.userData.__tankAnchor || null
+        }
+
+        if (nextHovered !== hoveredTankAnchor) {
+          tankInstances.forEach((anchor) => {
+            anchor.traverse((c) => {
+              if (c.userData.__outlineMesh) c.userData.__outlineMesh.visible = anchor === nextHovered
+            })
+          })
+          hoveredTankAnchor = nextHovered
+        }
+        canvas.style.cursor = isSelectMode.value ? 'default' : (nextHovered ? 'pointer' : '')
       }
 
       threeRenderer.resetState()
