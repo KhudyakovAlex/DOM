@@ -134,13 +134,25 @@ const tankVersion = ref(Date.now())
 
 const TANK_SAND_COLOR = new THREE.Color('#d2b48c') // песочный
 // Настройка ориентации танка на карте
-const TANK_ROT_X = -Math.PI / 2 // чтобы модель "стояла" на земле
+const TANK_ROT_X = Math.PI / 2 // чтобы модель "стояла" на земле
 const TANK_ROT_Y = 0
 const TANK_ROT_Z = 0
-// "Отзеркалить по поверхности земли" интерпретируем как переворот по вертикали.
-// Для glTF часто проще/надёжнее сделать это дополнительным поворотом на 180° вокруг X.
-const TANK_FLIP_OVER_GROUND = true
-let tankGroundOffset = 0 // в локальных единицах модели (домножаем на scale)
+const TANK_INITIAL_HEADING_RAD = Math.PI // запад
+const TANK_SPEED_MPS = 40 / 3.6 // 40 км/ч (в 2 раза быстрее)
+const TANK_TURN_RATE_RAD_S = (Math.PI / 2) / 5 // 90° за 5 сек
+// Подстройка "куда смотрит" модель (если поедет задом — поставим Math.PI)
+const TANK_MODEL_YAW_FIX_RAD = Math.PI
+let lastAnimTimeMs = 0
+
+function toMercator(lngLat) {
+  const c = maplibregl.MercatorCoordinate.fromLngLat([lngLat.lng, lngLat.lat], 0)
+  return {
+    x: c.x,
+    y: c.y,
+    z: c.z,
+    scale: c.meterInMercatorCoordinateUnits()
+  }
+}
 
 const BUILDING_OPACITY_2D = 0.35
 const BUILDING_OPACITY_3D = 0.6
@@ -429,13 +441,17 @@ function addPoint(button, lngLat) {
 }
 
 function addLineVertex(lngLat) {
-  if (!isDrawingLine.value) {
-    isDrawingLine.value = true
-    currentLine.value = []
+  // Если есть танк и уже есть 1-я точка (после постановки) — это траектория танка
+  if (tankInstances.length > 0 && isDrawingLine.value && currentLine.value.length >= 1) {
+    pushTrajectoryPoint(lngLat)
+  } else {
+    if (!isDrawingLine.value) {
+      isDrawingLine.value = true
+      currentLine.value = []
+    }
+    currentLine.value.push({ lng: lngLat.lng, lat: lngLat.lat })
+    updateLinesSources()
   }
-
-  currentLine.value.push({ lng: lngLat.lng, lat: lngLat.lat })
-  updateLinesSources()
 
   const toastId = nextToastId++
   const toast = {
@@ -522,17 +538,76 @@ function addTankAt(lngLat) {
 
   if (!tankTemplate || !threeScene || !map) return
 
-  const obj = tankTemplate.clone(true)
-  obj.rotation.set(TANK_ROT_X, TANK_ROT_Y, TANK_ROT_Z)
-  if (TANK_FLIP_OVER_GROUND) obj.rotateX(Math.PI)
+  const coord = toMercator(lngLat)
+
+  // Иерархия чтобы yaw был вокруг вертикальной оси через центр
+  const anchor = new THREE.Group()
+  const yaw = new THREE.Group()   // вращение вокруг мировой вертикали (Z)
+  const align = new THREE.Group() // "укладка" glTF (Y-up) на карту
+
+  yaw.rotation.z = TANK_INITIAL_HEADING_RAD + TANK_MODEL_YAW_FIX_RAD
+  align.rotation.set(TANK_ROT_X, TANK_ROT_Y, TANK_ROT_Z)
+  align.add(tankTemplate.clone(true))
+  yaw.add(align)
+  anchor.add(yaw)
+
   // Позиция/scale считаются в render() относительно центра карты (как в примере),
   // чтобы убрать дрожание из-за огромных mercator координат.
-  obj.userData.__lng = lngLat.lng
-  obj.userData.__lat = lngLat.lat
-  obj.userData.__placedId = id
-  threeScene.add(obj)
-  tankInstances.push(obj)
+  anchor.userData.__x = coord.x
+  anchor.userData.__y = coord.y
+  anchor.userData.__z = coord.z
+  anchor.userData.__scale = coord.scale
+  anchor.userData.__heading = TANK_INITIAL_HEADING_RAD
+  anchor.userData.__waypoints = [] // [{x,y,z,scale}]
+  anchor.userData.__targetIdx = null
+  anchor.userData.__state = 'idle' // idle | turning | moving
+  anchor.userData.__placedId = id
+  anchor.userData.__yaw = yaw
+
+  threeScene.add(anchor)
+  tankInstances.push(anchor)
   map.triggerRepaint()
+}
+
+function startTrajectoryAt(lngLat) {
+  // начинаем рисование ломаной с первой точки
+  isDrawingLine.value = true
+  currentLine.value = [{ lng: lngLat.lng, lat: lngLat.lat }]
+  updateLinesSources()
+
+  const tank = tankInstances[tankInstances.length - 1]
+  if (!tank || !map) return
+  tank.userData.__waypoints = [toMercator(lngLat)]
+  tank.userData.__targetIdx = null
+  tank.userData.__state = 'idle'
+}
+
+function pushTrajectoryPoint(lngLat) {
+  currentLine.value.push({ lng: lngLat.lng, lat: lngLat.lat })
+  updateLinesSources()
+
+  const tank = tankInstances[tankInstances.length - 1]
+  if (!tank || !map) return
+  tank.userData.__waypoints.push(toMercator(lngLat))
+
+  // если это первая "целевая" точка (вторая вершина) — запускаем поворот/движение
+  if (tank.userData.__state === 'idle' && tank.userData.__waypoints.length >= 2) {
+    tank.userData.__targetIdx = 1
+    tank.userData.__state = 'turning'
+  }
+}
+
+function normalizeAngle(a) {
+  let x = a
+  while (x <= -Math.PI) x += Math.PI * 2
+  while (x > Math.PI) x -= Math.PI * 2
+  return x
+}
+
+function stepAngle(current, target, maxStep) {
+  const diff = normalizeAngle(target - current)
+  if (Math.abs(diff) <= maxStep) return target
+  return current + Math.sign(diff) * maxStep
 }
 
 function tintTankToSand(root) {
@@ -597,20 +672,19 @@ function ensureThreeLayer() {
       loader.load(
         url,
         (gltf) => {
-          tankTemplate = gltf.scene
-          tintTankToSand(tankTemplate)
-          // вычисляем смещение до "земли" по bounding box с учётом ориентации
-          try {
-            const tmp = tankTemplate.clone(true)
-            tmp.rotation.set(TANK_ROT_X, TANK_ROT_Y, TANK_ROT_Z)
-            if (TANK_FLIP_OVER_GROUND) tmp.rotateX(Math.PI)
-            tmp.scale.set(1, 1, 1)
-            tmp.updateMatrixWorld(true)
-            const box = new THREE.Box3().setFromObject(tmp)
-            tankGroundOffset = -box.min.z
-          } catch {
-            tankGroundOffset = 0
-          }
+          const raw = gltf.scene
+          tintTankToSand(raw)
+
+          // Нормализуем pivot модели:
+          // - центр по X/Z в (0,0)
+          // - низ по Y в 0 (glTF обычно Y-up)
+          const box = new THREE.Box3().setFromObject(raw)
+          const center = box.getCenter(new THREE.Vector3())
+          const minY = box.min.y
+          raw.position.set(-center.x, -minY, -center.z)
+
+          tankTemplate = new THREE.Group()
+          tankTemplate.add(raw)
           // Ставим уже добавленные точки (если были клики до загрузки модели)
           const existing = placedModels.value.slice()
           placedModels.value = []
@@ -629,6 +703,13 @@ function ensureThreeLayer() {
       if (!threeRenderer || !threeScene || !threeCamera) return
       if (!is3D.value) return
 
+      const now = performance.now()
+      if (!lastAnimTimeMs) lastAnimTimeMs = now
+      let dt = (now - lastAnimTimeMs) / 1000
+      lastAnimTimeMs = now
+      // clamp, чтобы при сворачивании окна не "телепортировались"
+      dt = Math.min(dt, 0.05)
+
       const mtx = Array.isArray(matrix)
         ? matrix
         : matrix?.defaultProjectionData?.mainMatrix || matrix?.mainMatrix || matrix
@@ -645,23 +726,68 @@ function ensureThreeLayer() {
       threeCamera.projectionMatrix = m.multiply(l)
 
       for (const obj of tankInstances) {
-        const lng = obj.userData.__lng
-        const lat = obj.userData.__lat
-        if (lng === undefined || lat === undefined) continue
+        const waypoints = obj.userData.__waypoints
+        const targetIdx = obj.userData.__targetIdx
+        const state = obj.userData.__state
+        const scale = obj.userData.__scale
+        const yaw = obj.userData.__yaw
+        if (!scale) continue
 
-        const coord = maplibregl.MercatorCoordinate.fromLngLat([lng, lat], 0)
-        const scale = coord.meterInMercatorCoordinateUnits()
+        if (state === 'turning' && targetIdx !== null && waypoints?.[targetIdx]) {
+          const t = waypoints[targetIdx]
+          const dx = t.x - obj.userData.__x
+          const dy = t.y - obj.userData.__y
+          const desired = Math.atan2(dy, dx)
+          obj.userData.__heading = stepAngle(obj.userData.__heading, desired, TANK_TURN_RATE_RAD_S * dt)
+
+          if (Math.abs(normalizeAngle(desired - obj.userData.__heading)) < 0.02) {
+            obj.userData.__heading = desired
+            obj.userData.__state = 'moving'
+          }
+        } else if (state === 'moving' && targetIdx !== null && waypoints?.[targetIdx]) {
+          const t = waypoints[targetIdx]
+          const dx = t.x - obj.userData.__x
+          const dy = t.y - obj.userData.__y
+          const dist = Math.hypot(dx, dy)
+          const step = TANK_SPEED_MPS * dt * scale
+
+          if (dist <= step || dist < 1e-12) {
+            obj.userData.__x = t.x
+            obj.userData.__y = t.y
+            obj.userData.__z = t.z
+            // следующая цель?
+            if (targetIdx + 1 < waypoints.length) {
+              obj.userData.__targetIdx = targetIdx + 1
+              obj.userData.__state = 'turning'
+            } else {
+              obj.userData.__state = 'idle'
+              obj.userData.__targetIdx = null
+            }
+          } else {
+            const ux = dx / dist
+            const uy = dy / dist
+            obj.userData.__x += ux * step
+            obj.userData.__y += uy * step
+            obj.userData.__heading = Math.atan2(uy, ux)
+          }
+        }
+
+        // yaw вокруг вертикальной оси через центр
+        if (yaw) yaw.rotation.z = (obj.userData.__heading ?? 0) + TANK_MODEL_YAW_FIX_RAD
 
         obj.position.set(
-          coord.x - center.x,
-          coord.y - center.y,
-          (coord.z - center.z) + tankGroundOffset * scale
+          obj.userData.__x - center.x,
+          obj.userData.__y - center.y,
+          (obj.userData.__z - center.z)
         )
         obj.scale.set(scale, scale, scale)
       }
 
       threeRenderer.resetState()
       threeRenderer.render(threeScene, threeCamera)
+
+      // просим перерисовку для анимации
+      if (tankInstances.length > 0) map.triggerRepaint()
     }
   }
 
@@ -921,7 +1047,10 @@ onMounted(() => {
       toggleSelectionAtEvent(e)
       return
     }
+    // Новый танк — новая траектория
+    clearPlacedModels()
     addTankAt(e.lngLat)
+    startTrajectoryAt(e.lngLat)
   }
   const onRightClick = (e) => {
     // чтобы не всплывало стандартное меню браузера
