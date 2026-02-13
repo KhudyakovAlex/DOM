@@ -98,6 +98,7 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import { Protocol } from 'pmtiles'
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js'
 
 const mapContainer = ref(null)
 let map = null
@@ -133,8 +134,8 @@ const tankInstances = []
 const tankVersion = ref(Date.now())
 
 const TANK_SAND_COLOR = new THREE.Color('#d2b48c') // песочный
-const TANK_OUTLINE_COLOR = 0x00bfff // голубой силуэт при наведении
-const TANK_OUTLINE_SCALE = 1.04 // толщина обводки (2–4% больше модели)
+const TANK_OUTLINE_COLOR = '#00bfff' // голубой силуэт при наведении
+const TANK_OUTLINE_WIDTH_PX = 4 // фиксированная толщина в пикселях (не зависит от зума)
 // Настройка ориентации танка на карте
 const TANK_ROT_X = Math.PI / 2 // чтобы модель "стояла" на земле
 const TANK_ROT_Y = 0
@@ -150,6 +151,316 @@ const mouseState = { x: 0, y: 0 }
 let hoveredTankAnchor = null
 let raycaster = null
 const mouseNDC = new THREE.Vector2()
+
+// 2D overlay canvas for silhouette outline (фикс. толщина в px)
+let silhouetteCanvas = null
+let silhouetteCtx = null
+let silhouetteMaskCanvas = null
+let silhouetteMaskCtx = null
+let silhouetteCssW = 0
+let silhouetteCssH = 0
+let silhouetteDpr = 0
+
+// temp objects to reduce allocations
+const _silTmpV = new THREE.Vector3()
+const _silTmpP0 = new THREE.Vector3()
+const _silTmpP1 = new THREE.Vector3()
+const _silTmpN = new THREE.Vector3()
+const _silTmpNormalMatrix = new THREE.Matrix3()
+const _silTmpCentroid = new THREE.Vector3()
+const _silTmpNear = new THREE.Vector3()
+const _silTmpFar = new THREE.Vector3()
+const _silTmpDir = new THREE.Vector3()
+
+const TANK_HOVER_MASK_OPACITY = 0.35
+
+function ensureSilhouetteOverlayCanvas(m) {
+  if (silhouetteCanvas) return
+  silhouetteCanvas = document.createElement('canvas')
+  silhouetteCanvas.style.position = 'absolute'
+  silhouetteCanvas.style.left = '0'
+  silhouetteCanvas.style.top = '0'
+  silhouetteCanvas.style.pointerEvents = 'none'
+  silhouetteCanvas.style.zIndex = '2'
+  m.getContainer().appendChild(silhouetteCanvas)
+  silhouetteCtx = silhouetteCanvas.getContext('2d', { alpha: true })
+  silhouetteMaskCanvas = document.createElement('canvas')
+  silhouetteMaskCtx = silhouetteMaskCanvas.getContext('2d', { alpha: true })
+  syncSilhouetteOverlayCanvasSize(m)
+}
+
+function syncSilhouetteOverlayCanvasSize(m) {
+  if (!silhouetteCanvas || !silhouetteCtx || !silhouetteMaskCanvas || !silhouetteMaskCtx) return
+  const base = m.getCanvas()
+  const rect = base.getBoundingClientRect()
+  const cssW = Math.max(1, Math.round(rect.width || base.clientWidth || 1))
+  const cssH = Math.max(1, Math.round(rect.height || base.clientHeight || 1))
+  const dpr = window.devicePixelRatio || 1
+
+  // fast path: nothing changed
+  if (cssW === silhouetteCssW && cssH === silhouetteCssH && dpr === silhouetteDpr) return
+
+  silhouetteCssW = cssW
+  silhouetteCssH = cssH
+  silhouetteDpr = dpr
+
+  silhouetteCanvas.width = Math.max(1, Math.round(cssW * dpr))
+  silhouetteCanvas.height = Math.max(1, Math.round(cssH * dpr))
+  silhouetteCanvas.style.width = `${cssW}px`
+  silhouetteCanvas.style.height = `${cssH}px`
+
+  silhouetteMaskCanvas.width = silhouetteCanvas.width
+  silhouetteMaskCanvas.height = silhouetteCanvas.height
+
+  // draw in CSS px coordinates
+  silhouetteCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  silhouetteMaskCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+}
+
+function clearSilhouetteOverlay() {
+  if (!silhouetteCtx || silhouetteCssW <= 0 || silhouetteCssH <= 0) return
+  silhouetteCtx.clearRect(0, 0, silhouetteCssW, silhouetteCssH)
+}
+
+function tagTankAnchorOnMeshes(anchor) {
+  if (!anchor) return
+  anchor.traverse((child) => {
+    if (!child?.isMesh) return
+    child.userData.__tankAnchor = anchor
+  })
+}
+
+function getSilhouetteCacheForGeometry(geometry) {
+  const ud = geometry.userData || (geometry.userData = {})
+  if (ud.__silhouetteCache) return ud.__silhouetteCache
+
+  // Build adjacency by merging vertices by POSITION (UV/normal seams break adjacency).
+  // Do it once and cache, so per-frame cost is low.
+  let srcGeo = geometry
+  try {
+    // mergeVertices returns an indexed geometry with shared vertices (tolerance in local units)
+    srcGeo = mergeVertices(srcGeo, 1e-5)
+  } catch {
+    // If merge fails, fall back to original (may yield no manifold edges on seam-heavy meshes)
+    srcGeo = geometry
+  }
+  if (!srcGeo.index) {
+    try {
+      srcGeo = mergeVertices(srcGeo)
+    } catch {
+      return null
+    }
+  }
+
+  const posAttr = srcGeo.attributes?.position
+  const idxAttr = srcGeo.index
+  if (!posAttr || !idxAttr) return null
+  if (posAttr.itemSize !== 3) return null
+
+  const positions = posAttr.array
+  const vertexCount = posAttr.count
+  const index = idxAttr.array
+  const triCount = Math.floor(index.length / 3)
+
+  // face normals in local space (computed once)
+  const faceNormals = new Float32Array(triCount * 3)
+
+  // edge -> [f0, f1]
+  const edgeFaces = new Map()
+  const addEdge = (a, b, faceIdx) => {
+    const i0 = a < b ? a : b
+    const i1 = a < b ? b : a
+    const key = `${i0}_${i1}`
+    const arr = edgeFaces.get(key)
+    if (!arr) edgeFaces.set(key, [faceIdx])
+    else if (arr.length < 2) arr.push(faceIdx)
+  }
+
+  const ax = (i) => positions[i * 3 + 0]
+  const ay = (i) => positions[i * 3 + 1]
+  const az = (i) => positions[i * 3 + 2]
+
+  // store triangle indices for per-frame front/back classification in screen space
+  const triA = new Int32Array(triCount)
+  const triB = new Int32Array(triCount)
+  const triC = new Int32Array(triCount)
+
+  for (let f = 0; f < triCount; f++) {
+    const ia = index[f * 3 + 0]
+    const ib = index[f * 3 + 1]
+    const ic = index[f * 3 + 2]
+    triA[f] = ia
+    triB[f] = ib
+    triC[f] = ic
+
+    // normal = (c - b) x (a - b)
+    const abx = ax(ia) - ax(ib)
+    const aby = ay(ia) - ay(ib)
+    const abz = az(ia) - az(ib)
+    const cbx = ax(ic) - ax(ib)
+    const cby = ay(ic) - ay(ib)
+    const cbz = az(ic) - az(ib)
+
+    let nx = cby * abz - cbz * aby
+    let ny = cbz * abx - cbx * abz
+    let nz = cbx * aby - cby * abx
+    const len = Math.hypot(nx, ny, nz) || 1
+    nx /= len
+    ny /= len
+    nz /= len
+    faceNormals[f * 3 + 0] = nx
+    faceNormals[f * 3 + 1] = ny
+    faceNormals[f * 3 + 2] = nz
+
+    addEdge(ia, ib, f)
+    addEdge(ib, ic, f)
+    addEdge(ic, ia, f)
+  }
+
+  // store only manifold edges (2 adjacent faces)
+  const edgesI0 = []
+  const edgesI1 = []
+  const edgesF0 = []
+  const edgesF1 = []
+  for (const [key, faces] of edgeFaces.entries()) {
+    if (faces.length !== 2) continue
+    const [s0, s1] = key.split('_')
+    edgesI0.push(Number(s0))
+    edgesI1.push(Number(s1))
+    edgesF0.push(faces[0])
+    edgesF1.push(faces[1])
+  }
+
+  const cache = {
+    geometry: srcGeo,
+    positions,
+    vertexCount,
+    faceNormals,
+    faceCount: triCount,
+    index,
+    triA,
+    triB,
+    triC,
+    edgesI0: Int32Array.from(edgesI0),
+    edgesI1: Int32Array.from(edgesI1),
+    edgesF0: Int32Array.from(edgesF0),
+    edgesF1: Int32Array.from(edgesF1)
+  }
+
+  ud.__silhouetteCache = cache
+  return cache
+}
+
+function drawSilhouetteOverlay(anchor, camera) {
+  if (!silhouetteCtx || !silhouetteCanvas || !silhouetteMaskCanvas || !silhouetteMaskCtx) return
+  if (!anchor) {
+    clearSilhouetteOverlay()
+    return
+  }
+
+  const w = silhouetteCssW
+  const h = silhouetteCssH
+  if (w <= 1 || h <= 1) return
+
+  // 1) Build filled silhouette mask in 2D (union of projected triangles)
+  // reset state in case something modified it
+  silhouetteMaskCtx.globalAlpha = 1
+  silhouetteMaskCtx.globalCompositeOperation = 'source-over'
+  silhouetteMaskCtx.clearRect(0, 0, w, h)
+  silhouetteMaskCtx.fillStyle = '#ffffff'
+  let trianglesDrawnTotal = 0
+
+  anchor.traverse((child) => {
+    if (!child?.isMesh || !child.geometry) return
+    const geo = child.geometry
+    const posAttr = geo.attributes?.position
+    if (!posAttr || posAttr.itemSize !== 3) return
+
+    const positions = posAttr.array
+    const vCount = posAttr.count
+    const idx = geo.index?.array || null
+
+    // cache projected vertices for this mesh
+    const mud = child.userData || (child.userData = {})
+    let ndc = mud.__silMaskNdc
+    if (!ndc || ndc.length !== vCount * 3) {
+      ndc = new Float32Array(vCount * 3)
+      mud.__silMaskNdc = ndc
+    }
+
+    for (let i = 0; i < vCount; i++) {
+      _silTmpV
+        .set(positions[i * 3 + 0], positions[i * 3 + 1], positions[i * 3 + 2])
+        .applyMatrix4(child.matrixWorld)
+      _silTmpP0.copy(_silTmpV).project(camera)
+      ndc[i * 3 + 0] = _silTmpP0.x
+      ndc[i * 3 + 1] = _silTmpP0.y
+      ndc[i * 3 + 2] = _silTmpP0.z
+    }
+
+    silhouetteMaskCtx.beginPath()
+    let trianglesDrawn = 0
+
+    const drawTri = (ia, ib, ic) => {
+      const ax = ndc[ia * 3 + 0]; const ay = ndc[ia * 3 + 1]; const az = ndc[ia * 3 + 2]
+      const bx = ndc[ib * 3 + 0]; const by = ndc[ib * 3 + 1]; const bz = ndc[ib * 3 + 2]
+      const cx = ndc[ic * 3 + 0]; const cy = ndc[ic * 3 + 1]; const cz = ndc[ic * 3 + 2]
+      if (!Number.isFinite(ax + ay + az + bx + by + bz + cx + cy + cz)) return
+
+      const x0 = (ax + 1) * 0.5 * w
+      const y0 = (1 - ay) * 0.5 * h
+      const x1 = (bx + 1) * 0.5 * w
+      const y1 = (1 - by) * 0.5 * h
+      const x2 = (cx + 1) * 0.5 * w
+      const y2 = (1 - cy) * 0.5 * h
+      if (!Number.isFinite(x0 + y0 + x1 + y1 + x2 + y2)) return
+
+      // skip triangles that are far outside viewport (keeps path size reasonable)
+      const minX = Math.min(x0, x1, x2)
+      const maxX = Math.max(x0, x1, x2)
+      const minY = Math.min(y0, y1, y2)
+      const maxY = Math.max(y0, y1, y2)
+      if (maxX < -200 || minX > w + 200 || maxY < -200 || minY > h + 200) return
+
+      silhouetteMaskCtx.moveTo(x0, y0)
+      silhouetteMaskCtx.lineTo(x1, y1)
+      silhouetteMaskCtx.lineTo(x2, y2)
+      silhouetteMaskCtx.closePath()
+      trianglesDrawn++
+    }
+
+    if (idx) {
+      for (let t = 0; t + 2 < idx.length; t += 3) drawTri(idx[t], idx[t + 1], idx[t + 2])
+    } else {
+      for (let i = 0; i + 2 < vCount; i += 3) drawTri(i, i + 1, i + 2)
+    }
+
+    if (trianglesDrawn > 0) {
+      silhouetteMaskCtx.fill()
+      trianglesDrawnTotal += trianglesDrawn
+    }
+  })
+
+  if (trianglesDrawnTotal === 0) {
+    // nothing to draw: clear and bail
+    silhouetteCtx.clearRect(0, 0, w, h)
+    return
+  }
+
+  // 2) Paint mask as a single-color overlay (fixed in screen space)
+  silhouetteCtx.clearRect(0, 0, w, h)
+  silhouetteCtx.save()
+  silhouetteCtx.globalCompositeOperation = 'source-over'
+  // IMPORTANT: destination size is in CSS px (w/h); source is DPR-scaled.
+  silhouetteCtx.globalAlpha = 1
+  silhouetteCtx.drawImage(silhouetteMaskCanvas, 0, 0, w, h)
+
+  silhouetteCtx.globalCompositeOperation = 'source-in'
+  silhouetteCtx.globalAlpha = TANK_HOVER_MASK_OPACITY
+  silhouetteCtx.fillStyle = TANK_OUTLINE_COLOR
+  silhouetteCtx.fillRect(0, 0, w, h)
+  silhouetteCtx.restore()
+}
 
 function toMercator(lngLat) {
   const c = maplibregl.MercatorCoordinate.fromLngLat([lngLat.lng, lngLat.lat], 0)
@@ -531,6 +842,7 @@ function clearPlacedModels() {
   placedModels.value = []
   tankInstances.length = 0
   hoveredTankAnchor = null
+  clearSilhouetteOverlay()
   if (threeScene) {
     // оставим только свет (первые 2 объекта)
     while (threeScene.children.length > 2) {
@@ -538,28 +850,6 @@ function clearPlacedModels() {
     }
   }
   if (map) map.triggerRepaint()
-}
-
-function addOutlineToTank(anchor) {
-  anchor.traverse((child) => {
-    if (!child.isMesh || !child.geometry || child.userData.__isOutline) return
-    const outline = new THREE.Mesh(
-      child.geometry,
-      new THREE.MeshBasicMaterial({
-        color: TANK_OUTLINE_COLOR,
-        side: THREE.BackSide,
-        depthWrite: false
-      })
-    )
-    outline.scale.setScalar(TANK_OUTLINE_SCALE)
-    outline.visible = false
-    outline.renderOrder = -1
-    outline.userData.__isOutline = true
-    outline.userData.__tankAnchor = anchor
-    child.add(outline)
-    child.userData.__outlineMesh = outline
-    child.userData.__tankAnchor = anchor
-  })
 }
 
 function addTankAt(lngLat) {
@@ -594,7 +884,9 @@ function addTankAt(lngLat) {
   anchor.userData.__placedId = id
   anchor.userData.__yaw = yaw
 
-  addOutlineToTank(anchor)
+  // важно для hover/raycast: помечаем все mesh ссылкой на anchor
+  tagTankAnchorOnMeshes(anchor)
+
   threeScene.add(anchor)
   tankInstances.push(anchor)
   map.triggerRepaint()
@@ -684,6 +976,8 @@ function ensureThreeLayer() {
       raycaster = new THREE.Raycaster()
       threeCamera = new THREE.Camera()
       threeScene = new THREE.Scene()
+      ensureSilhouetteOverlayCanvas(m)
+      m.on('resize', () => syncSilhouetteOverlayCanvasSize(m))
 
       m.on('mousemove', (e) => {
         mouseState.x = e.point.x
@@ -761,6 +1055,9 @@ function ensureThreeLayer() {
       const m = new THREE.Matrix4().fromArray(mtx)
       const l = new THREE.Matrix4().makeTranslation(center.x, center.y, center.z)
       threeCamera.projectionMatrix = m.multiply(l)
+      // important: we set projectionMatrix manually, so keep inverse in sync
+      threeCamera.projectionMatrixInverse.copy(threeCamera.projectionMatrix).invert()
+      threeCamera.updateMatrixWorld(true)
 
       for (const obj of tankInstances) {
         const waypoints = obj.userData.__waypoints
@@ -822,6 +1119,9 @@ function ensureThreeLayer() {
 
       // Raycasting: наведение на танк → обводка
       if (raycaster && tankInstances.length > 0) {
+        // make sure matrices are up to date before raycast & silhouette
+        threeScene.updateMatrixWorld(true)
+
         const canvas = map.getCanvas()
         const t = map.transform
         const w = (t?.width ?? canvas.getBoundingClientRect().width) || 1
@@ -837,7 +1137,7 @@ function ensureThreeLayer() {
         raycaster.ray.set(nearPt, dir)
 
         const meshes = []
-        tankInstances.forEach((a) => a.traverse((c) => { if (c.isMesh && !c.userData.__isOutline) meshes.push(c) }))
+        tankInstances.forEach((a) => a.traverse((c) => { if (c.isMesh) meshes.push(c) }))
         const hits = raycaster.intersectObjects(meshes, false)
 
         let nextHovered = null
@@ -847,14 +1147,15 @@ function ensureThreeLayer() {
         }
 
         if (nextHovered !== hoveredTankAnchor) {
-          tankInstances.forEach((anchor) => {
-            anchor.traverse((c) => {
-              if (c.userData.__outlineMesh) c.userData.__outlineMesh.visible = anchor === nextHovered
-            })
-          })
           hoveredTankAnchor = nextHovered
         }
         canvas.style.cursor = isSelectMode.value ? 'default' : (nextHovered ? 'pointer' : '')
+      }
+
+      // Silhouette outline overlay (фиксированная толщина в px)
+      if (silhouetteCanvas && silhouetteCtx) {
+        syncSilhouetteOverlayCanvasSize(map)
+        drawSilhouetteOverlay(hoveredTankAnchor, threeCamera)
       }
 
       threeRenderer.resetState()
@@ -1184,6 +1485,16 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (silhouetteCanvas) {
+    try {
+      silhouetteCanvas.remove()
+    } catch {
+      // ignore
+    }
+  }
+  silhouetteCanvas = null
+  silhouetteCtx = null
+
   if (map) {
     if (map.__domHandlers) {
       map.off('click', map.__domHandlers.onLeftClick)
